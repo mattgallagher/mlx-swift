@@ -93,4 +93,114 @@ class ExportTests: XCTestCase {
         }
     }
 
+    // MARK: - Callback-mode export
+
+    func testExportFunctionCallbackStreamsPrimitiveEvents() throws {
+        // Capture the primitive event stream for `x + y` and verify the
+        // sequence matches what mlx2coreml's parse_mlx_export_events_to_graph
+        // expects: inputs, optional keyword_inputs, primitive(Add), outputs.
+        let x = MLXArray([1, 2, 3], [3])
+        let y = MLXArray([4, 5, 6], [3])
+
+        var payloads: [MLXExportCallbackPayload] = []
+        try exportFunction(callback: { payloads.append($0) }) { arrays in
+            [arrays[0] + arrays[1]]
+        }(x, y: y)
+
+        XCTAssertFalse(payloads.isEmpty, "callback was never invoked")
+
+        // Find the "type" entries — they tag each payload as inputs /
+        // keyword_inputs / outputs / primitive.
+        let types = payloads.compactMap { payload -> String? in
+            if case let .string(s) = payload["type"] { return s }
+            return nil
+        }
+        XCTAssertTrue(types.contains("inputs"), "missing inputs payload: \(types)")
+        XCTAssertTrue(types.contains("outputs"), "missing outputs payload: \(types)")
+        XCTAssertTrue(types.contains("primitive"), "missing primitive payload: \(types)")
+
+        // The primitive payload should name the operation.
+        let primitivePayload = payloads.first { payload in
+            if case .string("primitive") = payload["type"] { return true }
+            return false
+        }
+        XCTAssertNotNil(primitivePayload)
+        if case let .string(name) = primitivePayload?["name"] {
+            XCTAssertTrue(
+                name.localizedCaseInsensitiveContains("add"),
+                "expected primitive name to mention Add, got \(name)"
+            )
+        } else {
+            XCTFail("primitive payload missing string 'name'")
+        }
+
+        // The inputs payload should carry one MLXExportTensorSpec per arg.
+        let inputsPayload = payloads.first { payload in
+            if case .string("inputs") = payload["type"] { return true }
+            return false
+        }
+        XCTAssertNotNil(inputsPayload)
+        if case let .tensorSpecs(specs) = inputsPayload?["inputs"] {
+            XCTAssertEqual(specs.count, 2)
+            for spec in specs {
+                XCTAssertEqual(spec.shape, [3])
+                XCTAssertEqual(spec.dtype, x.dtype)
+            }
+        } else {
+            XCTFail("inputs payload missing tensorSpecs under key 'inputs'")
+        }
+    }
+
+    func testExportFunctionCallbackHandlesConstants() throws {
+        // A captured non-input array should arrive as a `.namedArrays`
+        // payload with the constant's data.
+        let captured = MLXArray([10.0, 20.0, 30.0] as [Float], [3])
+        let x = MLXArray([1.0, 2.0, 3.0] as [Float], [3])
+
+        var sawConstants = false
+        try exportFunction(callback: { payload in
+            for (_, event) in payload.entries {
+                if case let .namedArrays(pairs) = event, !pairs.isEmpty {
+                    sawConstants = true
+                }
+            }
+        }) { arrays in
+            [arrays[0] + captured]
+        }(x)
+
+        XCTAssertTrue(sawConstants, "expected at least one namedArrays payload for captured constant")
+    }
+
+    func testExportFunctionCallbackKeywordInputsKeyIsKeywords() throws {
+        // Regression guard for the type/key distinction documented on
+        // `MLXExportCallbackPayload`: a `keyword_inputs` record carries
+        // its `(keyword, tensorName)` pairs under the key `"keywords"`,
+        // not `"keyword_inputs"`. See `mlx/export.cpp:719` and
+        // mlx2coreml's `parse_mlx_export_events_to_graph`.
+        let x = MLXArray([1, 2, 3], [3])
+        let y = MLXArray([4, 5, 6], [3])
+
+        var payloads: [MLXExportCallbackPayload] = []
+        try exportFunction(callback: { payloads.append($0) }) { arrays in
+            [arrays[0] + arrays[1]]
+        }(x, y: y)
+
+        let kwPayload = payloads.first { payload in
+            if case .string("keyword_inputs") = payload["type"] { return true }
+            return false
+        }
+        XCTAssertNotNil(kwPayload, "no keyword_inputs payload was emitted")
+        XCTAssertNil(
+            kwPayload?["keyword_inputs"],
+            "`keyword_inputs` should be the value of `type`, not a data key")
+        guard case let .namedStrings(pairs)? = kwPayload?["keywords"] else {
+            XCTFail("keyword_inputs payload missing namedStrings under key 'keywords'")
+            return
+        }
+        XCTAssertFalse(pairs.isEmpty)
+        XCTAssertTrue(
+            pairs.contains { $0.first == "y" },
+            "expected to see keyword `y` in the keyword_inputs payload, got: \(pairs)")
+    }
+
 }
